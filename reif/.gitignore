@@ -1,0 +1,12 @@
+# Ignore JSON files
+*.json
+
+# Ignore build/config/temp stuff
+lib/
+tests/
+tests/bin/
+tests/.cache/
+.cache/
+test
+test.c
+config.mk
