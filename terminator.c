@@ -1,5 +1,6 @@
 #define LF_X11
 #define LF_RUNARA
+#include <sys/ioctl.h>
 #include <X11/Xlib.h>
 #include <string.h>
 #include <limits.h>
@@ -87,7 +88,10 @@ static uint32_t termflags;
 static CursorState cursorstate;
 static CsiEscapeSeq csiseq;
 static TermCursor cursor, cursor_saved;
-static Cell *cells;
+static Cell *main_cells = NULL;
+static Cell *alt_cells = NULL;
+static Cell *cells = NULL; // The active lens pointing to either main or alt
+static bool alt_buffer_active = false;
 static uint32_t rows = 20;
 static uint32_t cols = 80;
 static lf_ui_state_t *ui;
@@ -359,8 +363,10 @@ void parsecsi(void)
     uint32_t argidx = 0;
     for (; i < csiseq.len; i++)
     {
-        if (csiseq.nparams >= (128 * 4))
+        // SECURE: Hard boundary set to 16 to perfectly match the struct capacity
+        if (csiseq.nparams >= 16)
             break;
+
         if (isdigit(csiseq.buf[i]))
         {
             if (argidx < sizeof(argbuf) - 1)
@@ -381,11 +387,13 @@ void parsecsi(void)
         }
     }
 
-    if (argidx > 0 && csiseq.nparams < (128 * 4))
+    // SECURE: Final check before writing the last trailing parameter
+    if (argidx > 0 && csiseq.nparams < 16)
     {
         argbuf[argidx] = '\0';
         csiseq.params[csiseq.nparams++] = atoi(argbuf);
     }
+
     csiseq.cmd[0] = csiseq.buf[i];
     if (i + 1 <= csiseq.len - 1)
     {
@@ -690,6 +698,7 @@ void handlecsi(void)
     case 'd':
     {
         movetosafe(cursor.x, dp - 1);
+        break;
     }
     case 'r':
     {
@@ -716,7 +725,52 @@ void handlecsi(void)
         handlealtcursor(true);
         break;
     }
+    case 'h':
+    {
+        // 1049 is the standard code to save cursor and switch to Alt Buffer
+        if (csiseq.prefix == '?' && csiseq.params[0] == 1049)
+        {
+            if (!alt_buffer_active)
+            {
+                alt_buffer_active = true;
+                handlealtcursor(false); // Save main buffer's cursor and scroll state
+                cells = alt_cells;      // Swap the lens to the Alt Buffer
+                head = 0;               // Reset circular buffer offset for a clean slate
 
+                // --- ADD THESE 4 LINES ---
+                // Give the new buffer a perfectly clean slate
+                scrolltop = 0;
+                scrollbottom = rows - 1;
+                cursor.x = 0;
+                cursor.y = 0;
+                // -------------------------
+
+                // Erase anything left over in the Alt Buffer from the last app
+                for (int y = 0; y < rows; y++)
+                {
+                    for (int x = 0; x < cols; x++)
+                    {
+                        clearcell(&cells[y * cols + x]);
+                    }
+                }
+            }
+        }
+        break;
+    }
+    case 'l':
+    {
+        // 1049 l switches back to the Main Buffer and restores cursor
+        if (csiseq.prefix == '?' && csiseq.params[0] == 1049)
+        {
+            if (alt_buffer_active)
+            {
+                alt_buffer_active = false;
+                cells = main_cells;    // Swap the lens back to the Main Buffer
+                handlealtcursor(true); // Restore original cursor, scroll, and head positions
+            }
+        }
+        break;
+    }
     case 'c':
     {
         if (csiseq.params[0] == 0)
@@ -954,6 +1008,10 @@ RnTextProps rendertext(RnState *state,
     float scale = 1.0f;
     if (font->selected_strike_size)
         scale = ((float)font->size / (float)font->selected_strike_size);
+
+    // OPTIMIZATION 3: Pre-calculate the division multiplier to save CPU cycles
+    float scale_multiplier = scale / 64.0f;
+
     for (unsigned int i = 0; i < hb_text->glyph_count; i++)
     {
         // Get the glyph from the glyph index
@@ -988,10 +1046,12 @@ RnTextProps rendertext(RnState *state,
         {
             continue;
         }
-        float x_advance = (hb_text->glyph_pos[i].x_advance / 64.0f) * scale;
-        float y_advance = (hb_text->glyph_pos[i].y_advance / 64.0f) * scale;
-        float x_offset = (hb_text->glyph_pos[i].x_offset / 64.0f) * scale;
-        float y_offset = (hb_text->glyph_pos[i].y_offset / 64.0f) * scale;
+
+        // Use the pre-calculated multiplier instead of performing division per-character
+        float x_advance = hb_text->glyph_pos[i].x_advance * scale_multiplier;
+        float y_advance = hb_text->glyph_pos[i].y_advance * scale_multiplier;
+        float x_offset = hb_text->glyph_pos[i].x_offset * scale_multiplier;
+        float y_offset = hb_text->glyph_pos[i].y_offset * scale_multiplier;
 
         vec2s glyph_pos = {
             pos.x + x_offset,
@@ -1021,19 +1081,61 @@ RnTextProps rendertext(RnState *state,
 
 void renderrows()
 {
+    float char_width = 12.0f;
+    float line_height = font.font->line_h;
+
+    // 1. Draw the Cursor Visualizer
+    // We draw this first so the white text renders cleanly on top of it.
+    if (!lf_flag_exists(&termflags, TERM_MODE_HIDE_CURSOR))
+    {
+        float cursor_px_x = cursor.x * char_width;
+        float cursor_px_y = cursor.y * line_height;
+
+        // Draw a solid gray block at the active cell.
+        // We use 150.0f for RGB to get a neutral gray that contrasts with black and white.
+        rn_rect_render_base_types(
+            ui->render_state,
+            cursor_px_x,
+            cursor_px_y,
+            char_width,
+            line_height,
+            0.0f,   // Rotation
+            150.0f, // R
+            150.0f, // G
+            150.0f, // B
+            255.0f  // Alpha (fully opaque)
+        );
+    }
+
+    // 2. Draw the Text Grid (Highly Optimized)
     float y = 0.0f;
     for (uint32_t i = 0; i < rows; i++)
     {
-        char *row = malloc(cols * sizeof(uint32_t) + 1);
+        // OPTIMIZATION 1: Fast Stack Allocation (Zero heap fragmentation)
+        char row[(cols * 4) + 1];
         char *rowptr = row;
-        for (uint32_t j = 0; j < cols; j++)
+
+        // OPTIMIZATION 2: Skip Dead Space
+        int32_t last_char = cols - 1;
+        while (last_char >= 0 && (cells[i * cols + last_char].codepoint == ' ' || cells[i * cols + last_char].codepoint == 0))
+        {
+            last_char--;
+        }
+
+        // Only run the UTF-8 encoder up to the last visible character
+        for (int32_t j = 0; j <= last_char; j++)
         {
             rowptr += utf8encode(cells[i * cols + j].codepoint, rowptr);
         }
         *rowptr = '\0';
-        rendertext(ui->render_state, row, font.font, (vec2s){.x = 0, .y = y}, RN_WHITE, true);
-        y += font.font->line_h;
-        free(row); // <--- ADD THIS LINE
+
+        // Only call the heavy Harfbuzz/Runara renderer if there is actually text to draw
+        if (last_char >= 0)
+        {
+            rendertext(ui->render_state, row, font.font, (vec2s){.x = 0, .y = y}, RN_WHITE, true);
+        }
+
+        y += line_height;
     }
 }
 
@@ -1216,7 +1318,156 @@ void charcb(lf_ui_state_t *ui, lf_window_t win, char *utf8, uint32_t utf8len)
 {
     (void)ui;
     (void)win;
+
+    // STRICT FIX: Only block Backspace/Delete (127 and 8).
+    // This allows Enter (\r), Ctrl+C, Ctrl+D, and Ctrl+L to pass through to the PTY.
+    if (utf8len == 1 && (utf8[0] == '\x7f' || utf8[0] == '\b'))
+    {
+        return;
+    }
+
     termwrite(utf8, utf8len, false);
+}
+
+/* * Hardware Key Callback */
+void keycb(lf_ui_state_t *ui, lf_window_t win, int32_t key, int32_t scancode, int32_t action, int32_t mods)
+{
+    (void)ui;
+    (void)win;
+    (void)scancode;
+    (void)mods;
+
+    if (action == LF_KEY_ACTION_RELEASE)
+    {
+        return;
+    }
+
+    char seq[8] = {0};
+    int seqlen = 0;
+
+    // Translate hardware keys to standard VT100/ANSI control sequences
+    if (key == KeyBackspace)
+    {
+        seq[0] = '\x7f';
+        seqlen = 1;
+    }
+    else if (key == KeyDelete)
+    {
+        strcpy(seq, "\033[3~");
+        seqlen = 4;
+    }
+    else if (key == KeyUp)
+    {
+        strcpy(seq, "\033[A");
+        seqlen = 3;
+    }
+    else if (key == KeyDown)
+    {
+        strcpy(seq, "\033[B");
+        seqlen = 3;
+    }
+    else if (key == KeyRight)
+    {
+        strcpy(seq, "\033[C");
+        seqlen = 3;
+    }
+    else if (key == KeyLeft)
+    {
+        strcpy(seq, "\033[D");
+        seqlen = 3;
+    }
+    else if (key == KeyTab)
+    {
+        seq[0] = '\t';
+        seqlen = 1;
+    }
+    /* --- FOR F8 --- */
+    else if (key == KeyF8)
+    {
+        strcpy(seq, "\033[19~");
+        seqlen = 5;
+    }
+    // Push the translated sequence directly into the PTY master file descriptor
+    if (seqlen > 0)
+    {
+        writetopty(seq, seqlen);
+    }
+}
+
+void update_terminal_geometry(uint32_t win_width, uint32_t win_height)
+{
+    // Get the exact line height directly from the rendering engine.
+    float line_height = (font.font != NULL) ? font.font->line_h : 25.0f;
+    float char_width = 12.0f;
+
+    // Prevent division by zero if window is minimized
+    if (win_width < char_width)
+        win_width = char_width;
+    if (win_height < line_height)
+        win_height = line_height;
+
+    uint32_t new_cols = win_width / char_width;
+    uint32_t new_rows = (win_height - 5) / line_height;
+
+    // Only hit the RAM if the grid size actually changed
+    if (new_cols != cols || new_rows != rows)
+    {
+        cols = new_cols;
+        rows = new_rows;
+
+        // Dynamically resize BOTH memory blocks AND the tabs array
+        main_cells = realloc(main_cells, sizeof(Cell) * rows * cols);
+        alt_cells = realloc(alt_cells, sizeof(Cell) * rows * cols);
+        tabs = realloc(tabs, sizeof(uint32_t) * cols); // <--- THE FIX
+
+        // Wipe the newly sized grids clean to prevent random garbage characters
+        memset(main_cells, 0, sizeof(Cell) * rows * cols);
+        memset(alt_cells, 0, sizeof(Cell) * rows * cols);
+
+        // Point the active lens to whichever buffer is currently in use
+        cells = alt_buffer_active ? alt_cells : main_cells;
+
+        // Rebuild the tab stops for the new width
+        for (uint32_t i = 0; i < cols; i++)
+        {
+            tabs[i] = (i % 4 == 0) ? 1 : 0;
+        }
+
+        // Reset boundaries to match the new height
+        scrolltop = 0;
+        scrollbottom = rows - 1;
+
+        // Clamp the cursor so it doesn't get trapped outside the new window
+        if (cursor.x >= cols)
+            cursor.x = cols - 1;
+        if (cursor.y >= rows)
+            cursor.y = rows - 1;
+    }
+
+    struct winsize ws = {
+        .ws_row = (unsigned short)rows,
+        .ws_col = (unsigned short)cols,
+        .ws_xpixel = (unsigned short)win_width,
+        .ws_ypixel = (unsigned short)win_height};
+
+    ioctl(masterfd, TIOCSWINSZ, &ws);
+}
+
+/* * Window Resize Callback */
+void resizecb(lf_ui_state_t *ui, lf_window_t win, uint32_t width, uint32_t height)
+{
+    (void)ui;
+    (void)width;
+    (void)height;
+
+    // Fetch the absolute exact size directly from the engine to guarantee accuracy
+    vec2s winsize = lf_win_get_size(win);
+
+    // Recalculate grid, realloc memory, and update the PTY
+    update_terminal_geometry((uint32_t)winsize.x, (uint32_t)winsize.y);
+
+    // Force an immediate frame render so it doesn't wait for a keypress
+    ui->needs_render = true;
 }
 
 int main(void)
@@ -1232,28 +1483,19 @@ int main(void)
     lf_windowing_init();
 
     lf_window_t win = lf_ui_core_create_window(1280, 720, "Terminator");
-
     ui = lf_ui_core_init(win);
     font = lf_asset_manager_request_font(ui, "JetBrains Mono Nerd Font", LF_FONT_STYLE_REGULAR, 20);
 
-    scrollbottom = rows - 1;
-    cells = malloc(sizeof(Cell) * rows * cols);
-    memset(cells, 0, sizeof(Cell) * rows * cols); // <--- ADD THIS LINE
-    tabs = malloc(sizeof(uint32_t) * cols);
+    // Get the ACTUAL window size dictated by the OS/Window Manager
+    vec2s initial_size = lf_win_get_size(win);
 
-    for (uint32_t i = 0; i < cols; i++)
-    {
-        if (i % 4 == 0)
-        {
-            tabs[i] = 1;
-        }
-        else
-        {
-            tabs[i] = 0;
-        }
-    }
+    // This single call now handles math, memory allocation, and PTY notification.
+    update_terminal_geometry((uint32_t)initial_size.x, (uint32_t)initial_size.y);
 
+    // Register Event Callbacks
     lf_win_set_typing_char_cb(win, charcb);
+    lf_win_set_key_cb(win, keycb);
+    lf_win_set_resize_cb(win, resizecb);
 
     fd_set fdset;
     int32_t x11fd = ConnectionNumber(lf_win_get_x11_display());
@@ -1292,13 +1534,13 @@ int main(void)
 
             lf_event_type_t curevent = lf_windowing_get_current_event();
 
-            // <--- ADD THIS CHECK
             if (curevent == LF_EVENT_WINDOW_CLOSE)
             {
                 break;
             }
+            // LF_EVENT_WINDOW_RESIZE is removed here because resizecb handles it natively
             else if (curevent == LF_EVENT_KEY_PRESS || curevent == LF_EVENT_TYPING_CHAR ||
-                     curevent == LF_EVENT_WINDOW_REFRESH || curevent == LF_EVENT_WINDOW_RESIZE)
+                     curevent == LF_EVENT_WINDOW_REFRESH)
             {
                 needs_render = true;
             }
@@ -1307,6 +1549,6 @@ int main(void)
             termnextevent(ui);
     }
 
-    printf("Hello World !!");
+    printf("Hello World !!\n");
     return EXIT_SUCCESS;
 }
