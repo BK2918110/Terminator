@@ -1,5 +1,6 @@
 #define LF_X11
 #define LF_RUNARA
+#include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <X11/Xlib.h>
 #include <string.h>
@@ -80,7 +81,7 @@ typedef enum
     TERM_MODE_LOCK_KEYBOARD = 1 << 15,
     TERM_MODE_ECHO = 1 << 16,
     TERM_MODE_CR_AND_LF = 1 << 17,
-    TERM_MODE_UTF8 = 1 << 17, // Note: This shares the same bit as CR_AND_LF
+    TERM_MODE_UTF8 = 1 << 18, // FIX: Separated the bit flag!
 } termmode_t;
 
 static uint32_t escflags;
@@ -100,6 +101,8 @@ static uint32_t *tabs;
 static uint32_t scrollbottom, scrollbottom_saved = 0;
 static uint32_t scrolltop, scrolltop_saved = 0;
 static uint32_t head, head_saved = 0;
+static int32_t scroll_offset = 0; // 0 = bottom, >0 = scrolled up into history
+static int32_t history_count = 0; // Tracks how many rows of history we actually have
 static uint32_t mostrecentcodepoint;
 
 static void moveto(int32_t x, int32_t y);
@@ -111,6 +114,7 @@ static Cell *getphysrow(int32_t logicalrow);
 static void clearcell(Cell *cell);
 static void handletab(int32_t count);
 static void deletecells(int32_t ncells);
+void setcell(uint32_t x, uint32_t y, uint32_t codepoint);
 
 void newline(bool setx)
 {
@@ -165,11 +169,6 @@ void movetosafe(int32_t x, int32_t y)
     moveto(x, y + (cursororigin ? scrolltop : 0));
 }
 
-void setcell(uint32_t x, uint32_t y, uint32_t codepoint)
-{
-    cells[y * cols + x].codepoint = codepoint;
-}
-
 bool iscontrol(uint32_t c)
 {
     if (((int32_t)c >= 0x00 && c <= 0x1F) || c == 0x7F)
@@ -194,7 +193,8 @@ void handlectrl(uint32_t c)
     case '\f':
     case '\v':
     case '\n':
-        newline(true);
+        // Respect the VT100 standard: only return to column 0 if the hardware flag is set
+        newline(lf_flag_exists(&termflags, TERM_MODE_CR_AND_LF));
         break;
     case '\t':
         handletab(1);
@@ -369,7 +369,8 @@ void parsecsi(void)
 
         if (isdigit(csiseq.buf[i]))
         {
-            if (argidx < sizeof(argbuf) - 1)
+            // SECURE: Cap the argument length to 5 digits (max 99999) to prevent atoi integer overflow
+            if (argidx < 5)
             {
                 argbuf[argidx++] = csiseq.buf[i];
             }
@@ -401,11 +402,32 @@ void parsecsi(void)
     }
 }
 
+// --- MEMORY ACCESSORS ---
+
+Cell *getphysrow(int32_t logicalrow)
+{
+    // FORCE signed integer math so negative scroll offsets calculate correctly
+    int32_t physrowidx = ((int32_t)head + logicalrow) % MAX_ROWS;
+    if (physrowidx < 0)
+        physrowidx += MAX_ROWS;
+    return &cells[physrowidx * cols];
+}
+
 Cell *cellat(int32_t x, int32_t y)
 {
-    int32_t physrow = (head + y) % MAX_ROWS;
-    return &cells[physrow * cols + x];
+    return &getphysrow(y)[x];
 }
+
+void setcell(uint32_t x, uint32_t y, uint32_t codepoint)
+{
+    getphysrow(y)[x].codepoint = codepoint;
+}
+
+void clearcell(Cell *cell)
+{
+    cell->codepoint = ' ';
+}
+// -------------------------
 
 void deletecells(int32_t ncells)
 {
@@ -559,15 +581,17 @@ void handlecsi(void)
     case 'G':
     case '`':
     {
-        moveto(dp - 1, cursor.y);
+        int32_t x = (csiseq.nparams > 0 && csiseq.params[0] > 0) ? csiseq.params[0] - 1 : 0;
+        moveto(x, cursor.y);
         break;
     }
     case 'H':
     case 'f':
     {
-        uint32_t x = csiseq.nparams > 1 ? csiseq.params[1] : 1;
-        uint32_t y = csiseq.nparams > 0 ? csiseq.params[0] : 1;
-        movetosafe(x - 1, y - 1);
+        // SECURE: 1-based coordinates with strict underflow protection
+        int32_t y = (csiseq.nparams > 0 && csiseq.params[0] > 0) ? csiseq.params[0] - 1 : 0;
+        int32_t x = (csiseq.nparams > 1 && csiseq.params[1] > 0) ? csiseq.params[1] - 1 : 0;
+        movetosafe(x, y);
         break;
     }
     case 'I':
@@ -697,21 +721,29 @@ void handlecsi(void)
     }
     case 'd':
     {
-        movetosafe(cursor.x, dp - 1);
+        int32_t y = (csiseq.nparams > 0 && csiseq.params[0] > 0) ? csiseq.params[0] - 1 : 0;
+        movetosafe(cursor.x, y);
         break;
     }
     case 'r':
     {
         if (csiseq.prefix == '?')
             break;
-        // Check nparams, then pull from the params array
-        uint32_t top = csiseq.nparams > 0 ? csiseq.params[0] - 1 : 0;
 
-        // FIX: Change csiseq.params > 1 to csiseq.nparams > 1
-        uint32_t bottom = csiseq.nparams > 1 ? csiseq.params[1] - 1 : rows - 1;
+        // SECURE: Prevent underflow to 4294967295 if parameters are omitted or 0
+        int32_t top = (csiseq.nparams > 0 && csiseq.params[0] > 0) ? csiseq.params[0] - 1 : 0;
+        int32_t bottom = (csiseq.nparams > 1 && csiseq.params[1] > 0) ? csiseq.params[1] - 1 : rows - 1;
 
-        scrolltop = top;
-        scrollbottom = bottom;
+        scrolltop = CLAMP(top, 0, rows - 1);
+        scrollbottom = CLAMP(bottom, 0, rows - 1);
+
+        // Failsafe: if top margin is somehow pushed below bottom margin, reset to default
+        if (scrolltop > scrollbottom)
+        {
+            scrolltop = 0;
+            scrollbottom = rows - 1;
+        }
+
         movetosafe(0, 0);
         break;
     }
@@ -727,31 +759,38 @@ void handlecsi(void)
     }
     case 'h':
     {
-        // 1049 is the standard code to save cursor and switch to Alt Buffer
-        if (csiseq.prefix == '?' && csiseq.params[0] == 1049)
+        if (csiseq.prefix == '?')
         {
-            if (!alt_buffer_active)
+            for (uint32_t i = 0; i < csiseq.nparams; i++)
             {
-                alt_buffer_active = true;
-                handlealtcursor(false); // Save main buffer's cursor and scroll state
-                cells = alt_cells;      // Swap the lens to the Alt Buffer
-                head = 0;               // Reset circular buffer offset for a clean slate
-
-                // --- ADD THESE 4 LINES ---
-                // Give the new buffer a perfectly clean slate
-                scrolltop = 0;
-                scrollbottom = rows - 1;
-                cursor.x = 0;
-                cursor.y = 0;
-                // -------------------------
-
-                // Erase anything left over in the Alt Buffer from the last app
-                for (int y = 0; y < rows; y++)
+                int p = csiseq.params[i];
+                if (p == 1049)
                 {
-                    for (int x = 0; x < cols; x++)
+                    if (!alt_buffer_active)
                     {
-                        clearcell(&cells[y * cols + x]);
+                        alt_buffer_active = true;
+                        handlealtcursor(false);
+                        cells = alt_cells;
+                        head = 0;
+                        scrolltop = 0;
+                        scrollbottom = rows - 1;
+                        cursor.x = 0;
+                        cursor.y = 0;
+                        for (int y = 0; y < rows; y++)
+                        {
+                            Cell *row = getphysrow(y);
+                            for (int x = 0; x < cols; x++)
+                                clearcell(&row[x]);
+                        }
                     }
+                }
+                else if (p == 7)
+                {
+                    lf_flag_set(&termflags, TERM_MODE_AUTO_WRAP);
+                }
+                else if (p == 25)
+                {
+                    lf_flag_unset(&termflags, TERM_MODE_HIDE_CURSOR);
                 }
             }
         }
@@ -759,14 +798,28 @@ void handlecsi(void)
     }
     case 'l':
     {
-        // 1049 l switches back to the Main Buffer and restores cursor
-        if (csiseq.prefix == '?' && csiseq.params[0] == 1049)
+        if (csiseq.prefix == '?')
         {
-            if (alt_buffer_active)
+            for (uint32_t i = 0; i < csiseq.nparams; i++)
             {
-                alt_buffer_active = false;
-                cells = main_cells;    // Swap the lens back to the Main Buffer
-                handlealtcursor(true); // Restore original cursor, scroll, and head positions
+                int p = csiseq.params[i];
+                if (p == 1049)
+                {
+                    if (alt_buffer_active)
+                    {
+                        alt_buffer_active = false;
+                        cells = main_cells;
+                        handlealtcursor(true);
+                    }
+                }
+                else if (p == 7)
+                {
+                    lf_flag_unset(&termflags, TERM_MODE_AUTO_WRAP);
+                }
+                else if (p == 25)
+                {
+                    lf_flag_set(&termflags, TERM_MODE_HIDE_CURSOR);
+                }
             }
         }
         break;
@@ -841,32 +894,40 @@ void handlecodepoint(uint32_t codepoint)
         return;
     }
 
-    // Using proper bitwise flag checking
-    if (lf_flag_exists(&cursorstate, CUR_STATE_ONWRAP))
+    // 1. Resolve Deferred Wrap State
+    if (cursorstate & CUR_STATE_ONWRAP)
     {
-        newline(true);
-    }
+        // CRITICAL: Unset the flag first using pure bitwise math
+        cursorstate &= ~CUR_STATE_ONWRAP;
 
-    if (cursor.x + 1 > cols)
-    {
         if (lf_flag_exists(&termflags, TERM_MODE_AUTO_WRAP))
         {
             newline(true);
         }
-        else
-        {
-            moveto(cols - 1, cursor.y);
-        }
     }
+
+    // 2. Safety clamp for out-of-bounds cursor
+    if (cursor.x >= cols)
+    {
+        cursor.x = cols - 1;
+    }
+
+    // 3. Write the actual character to memory
     setcell(cursor.x, cursor.y, codepoint);
     mostrecentcodepoint = codepoint;
-    if (cursor.x + 1 < cols)
+
+    // 4. Advance Cursor or Trigger Wrap State
+    if (cursor.x < cols - 1)
     {
         moveto(cursor.x + 1, cursor.y);
     }
     else
     {
-        cursorstate |= CUR_STATE_ONWRAP;
+        // Reached the right edge.
+        if (lf_flag_exists(&termflags, TERM_MODE_AUTO_WRAP))
+        {
+            cursorstate |= CUR_STATE_ONWRAP;
+        }
     }
 }
 
@@ -931,52 +992,80 @@ int32_t utf8encode(uint32_t codepoint, char *out)
     return 0;
 }
 
-Cell *getphysrow(int32_t logicalrow)
-{
-    int32_t physrowidx = (head + logicalrow) % MAX_ROWS;
-    return &cells[physrowidx * cols];
-}
-
-void clearcell(Cell *cell)
-{
-    cell->codepoint = ' ';
-}
-
 void scrollup(int32_t start, int32_t nscrolls)
 {
-    for (uint32_t i = 0; i <= scrollbottom - start - nscrolls; i++)
+    // NEVER advance the circular buffer head if we are in the Alt Buffer!
+    // The Alternate Buffer has no history, so head must stay stable.
+    if (!alt_buffer_active && start == 0 && scrollbottom == rows - 1)
     {
-        Cell *src = getphysrow(start + nscrolls + i);
-        Cell *dest = getphysrow(start + i);
-        memcpy(dest, src, sizeof(Cell) * cols);
-    }
+        head = (head + nscrolls) % MAX_ROWS;
 
-    for (uint32_t i = scrollbottom - nscrolls + 1; i <= scrollbottom; i++)
-    {
-        Cell *row = getphysrow(i);
-        for (uint32_t x = 0; x < cols; x++)
+        history_count += nscrolls;
+        if (history_count > MAX_ROWS - rows)
         {
-            clearcell(&row[x]);
+            history_count = MAX_ROWS - rows;
+        }
+
+        int32_t clear_start = scrollbottom - nscrolls + 1;
+        if (clear_start < start)
+            clear_start = start;
+
+        for (int32_t i = clear_start; i <= scrollbottom; i++)
+        {
+            Cell *row = getphysrow(i);
+            for (uint32_t x = 0; x < cols; x++)
+                clearcell(&row[x]);
+        }
+    }
+    else // Partial screen scroll (used heavily by nano)
+    {
+        int32_t limit = scrollbottom - start - nscrolls;
+        if (limit >= 0)
+        {
+            for (int32_t i = 0; i <= limit; i++)
+            {
+                Cell *src = getphysrow(start + nscrolls + i);
+                Cell *dest = getphysrow(start + i);
+                memmove(dest, src, sizeof(Cell) * cols);
+            }
+        }
+
+        int32_t clear_start = scrollbottom - nscrolls + 1;
+        if (clear_start < start)
+            clear_start = start;
+
+        for (int32_t i = clear_start; i <= scrollbottom; i++)
+        {
+            Cell *row = getphysrow(i);
+            for (uint32_t x = 0; x < cols; x++)
+                clearcell(&row[x]);
         }
     }
 }
 
 void scrolldown(int32_t start, int32_t nscrolls)
 {
-    for (int32_t i = scrollbottom - start - nscrolls; i >= 0; i--)
+    int32_t limit = scrollbottom - start - nscrolls;
+    if (limit >= 0)
     {
-        Cell *src = getphysrow(start + i);
-        Cell *dest = getphysrow(start + nscrolls + i);
-        memcpy(dest, src, sizeof(Cell) * cols);
+        for (int32_t i = limit; i >= 0; i--)
+        {
+            Cell *src = getphysrow(start + i);
+            Cell *dest = getphysrow(start + nscrolls + i);
+            memmove(dest, src, sizeof(Cell) * cols);
+        }
     }
 
-    for (uint32_t i = start; i <= start + nscrolls; i++)
+    // FIX: Exact boundary calculation to prevent erasing an extra line!
+    int32_t clear_end = start + nscrolls - 1;
+    if (clear_end > scrollbottom)
+        clear_end = scrollbottom;
+
+    for (int32_t i = start; i <= clear_end; i++)
     {
         Cell *row = getphysrow(i);
         for (uint32_t x = 0; x < cols; x++)
-        {
             clearcell(&row[x]);
-        }
     }
 }
 
@@ -1086,7 +1175,7 @@ void renderrows()
 
     // 1. Draw the Cursor Visualizer
     // We draw this first so the white text renders cleanly on top of it.
-    if (!lf_flag_exists(&termflags, TERM_MODE_HIDE_CURSOR))
+    if (!lf_flag_exists(&termflags, TERM_MODE_HIDE_CURSOR) && scroll_offset == 0)
     {
         float cursor_px_x = cursor.x * char_width;
         float cursor_px_y = cursor.y * line_height;
@@ -1107,17 +1196,19 @@ void renderrows()
         );
     }
 
-    // 2. Draw the Text Grid (Highly Optimized)
+    // 2. Draw the Text Grid (Highly Optimized Circular Buffer Read)
     float y = 0.0f;
     for (uint32_t i = 0; i < rows; i++)
     {
-        // OPTIMIZATION 1: Fast Stack Allocation (Zero heap fragmentation)
-        char row[(cols * 4) + 1];
-        char *rowptr = row;
+        char row_str[(cols * 4) + 1];
+        char *rowptr = row_str;
 
-        // OPTIMIZATION 2: Skip Dead Space
+        // Grab the correct row from the circular buffer factoring in the scroll_offset
+        Cell *phys_row = getphysrow(i - scroll_offset);
+
+        // Skip Dead Space
         int32_t last_char = cols - 1;
-        while (last_char >= 0 && (cells[i * cols + last_char].codepoint == ' ' || cells[i * cols + last_char].codepoint == 0))
+        while (last_char >= 0 && (phys_row[last_char].codepoint == ' ' || phys_row[last_char].codepoint == 0))
         {
             last_char--;
         }
@@ -1125,14 +1216,19 @@ void renderrows()
         // Only run the UTF-8 encoder up to the last visible character
         for (int32_t j = 0; j <= last_char; j++)
         {
-            rowptr += utf8encode(cells[i * cols + j].codepoint, rowptr);
+            uint32_t cp = phys_row[j].codepoint;
+
+            // FIX: Convert empty NULL memory into standard space to prevent string truncation
+            if (cp == 0)
+                cp = ' ';
+
+            rowptr += utf8encode(cp, rowptr);
         }
         *rowptr = '\0';
 
-        // Only call the heavy Harfbuzz/Runara renderer if there is actually text to draw
         if (last_char >= 0)
         {
-            rendertext(ui->render_state, row, font.font, (vec2s){.x = 0, .y = y}, RN_WHITE, true);
+            rendertext(ui->render_state, row_str, font.font, (vec2s){.x = 0, .y = y}, RN_WHITE, true);
         }
 
         y += line_height;
@@ -1215,8 +1311,7 @@ void writetopty(const char *buf, size_t len)
     }
 }
 
-uint32_t
-termhandlecharstream(const char *buf, uint32_t len)
+uint32_t termhandlecharstream(const char *buf, uint32_t len)
 {
     uint32_t n = 0;
     while (n < len)
@@ -1226,6 +1321,17 @@ termhandlecharstream(const char *buf, uint32_t len)
         if (lf_flag_exists(&termflags, TERM_MODE_UTF8))
         {
             charlen = utf8decode(buf + n, &codepoint);
+
+            // SECURE: Handle invalid and split characters during local echo
+            if (charlen == -1)
+            {
+                codepoint = 0xFFFD;
+                charlen = 1;
+            }
+            else if (n + charlen > len)
+            {
+                break;
+            }
         }
         else
         {
@@ -1243,17 +1349,21 @@ void termwrite(const char *buf, size_t len, bool mayecho)
     {
         termhandlecharstream(buf, len);
     }
+
+    // If CR_AND_LF is disabled, write raw to the PTY and EXIT immediately
     if (!lf_flag_exists(&termflags, TERM_MODE_CR_AND_LF))
     {
         writetopty(buf, len);
+        return; // <--- THE CRITICAL FIX: Stop execution here so it doesn't double-write!
     }
 
+    // Only run this translation loop if CR_AND_LF is explicitly enabled
     while (len > 0)
     {
         if (*buf == '\r')
         {
-            // If the current character is a carriage return,
-            writetopty("\r\n", 1);
+            // If the current character is a carriage return, write BOTH \r and \n
+            writetopty("\r\n", 2); // FIX: Changed byte length from 1 to 2
             buf++;
             len--;
         }
@@ -1271,7 +1381,7 @@ void termwrite(const char *buf, size_t len, bool mayecho)
 
             // Decrement length
             len -= next_cr - buf;
-            // Advance buffeer to the next carriage return
+            // Advance buffer to the next carriage return
             buf = next_cr;
         }
     }
@@ -1281,6 +1391,15 @@ size_t readfrompty(void)
 {
     static char buf[SHRT_MAX];
     static uint32_t buflen = 0;
+
+    // SECURE: Kernel Deadlock Prevention.
+    // If the buffer somehow reaches absolute maximum capacity without parsing a valid character,
+    // forcefully drop the oldest 256 bytes so the read() pipe can breathe.
+    if (buflen >= SHRT_MAX - 4)
+    {
+        memmove(buf, buf + 256, buflen - 256);
+        buflen -= 256;
+    }
 
     int32_t nbytes = read(masterfd, buf + buflen, sizeof(buf) - buflen);
 
@@ -1297,9 +1416,19 @@ size_t readfrompty(void)
     {
         uint32_t codepoint;
         int32_t len = utf8decode(&buf[iter], &codepoint);
-        if (len == -1 || len > buflen)
-            break;
-        // printf("%i\n", codepoint);
+
+        // CRITICAL FIX 1: Prevent Infinite Stall on Invalid UTF-8
+        if (len == -1)
+        {
+            codepoint = 0xFFFD; // Render standard Unicode missing character block
+            len = 1;            // Consume 1 byte and keep moving
+        }
+        // CRITICAL FIX 2: Prevent Buffer Underflow on Split Characters
+        else if (iter + len > buflen)
+        {
+            break; // Stop parsing and wait for the rest of the bytes next frame
+        }
+
         handlecodepoint(codepoint);
         iter += len;
     }
@@ -1326,6 +1455,9 @@ void charcb(lf_ui_state_t *ui, lf_window_t win, char *utf8, uint32_t utf8len)
         return;
     }
 
+    scroll_offset = 0;
+    ui->needs_render = true;
+
     termwrite(utf8, utf8len, false);
 }
 
@@ -1340,6 +1472,32 @@ void keycb(lf_ui_state_t *ui, lf_window_t win, int32_t key, int32_t scancode, in
     if (action == LF_KEY_ACTION_RELEASE)
     {
         return;
+    }
+
+    // Handle Scrollback Keyboard Shortcuts (Assumes mods & 1 is ShiftMask)
+    if (!alt_buffer_active && (mods & 1))
+    {
+        if (key == KeyPageUp)
+            scroll_offset += rows / 2;
+        else if (key == KeyPageDown)
+            scroll_offset -= rows / 2;
+        else if (key == KeyUp)
+            scroll_offset += 1;
+        else if (key == KeyDown)
+            scroll_offset -= 1;
+
+        // Clamp offset bounds
+        if (scroll_offset > history_count)
+            scroll_offset = history_count;
+        if (scroll_offset < 0)
+            scroll_offset = 0;
+
+        // If we processed a scroll key, render immediately and do NOT send to PTY
+        if (key == KeyPageUp || key == KeyPageDown || key == KeyUp || key == KeyDown)
+        {
+            ui->needs_render = true;
+            return;
+        }
     }
 
     char seq[8] = {0};
@@ -1415,22 +1573,37 @@ void update_terminal_geometry(uint32_t win_width, uint32_t win_height)
         cols = new_cols;
         rows = new_rows;
 
-        // Dynamically resize BOTH memory blocks AND the tabs array
-        main_cells = realloc(main_cells, sizeof(Cell) * rows * cols);
-        alt_cells = realloc(alt_cells, sizeof(Cell) * rows * cols);
-        tabs = realloc(tabs, sizeof(uint32_t) * cols); // <--- THE FIX
+        // SECURE: Use temporary pointers to prevent memory leaks if realloc fails
+        Cell *temp_main = realloc(main_cells, sizeof(Cell) * MAX_ROWS * cols);
+        Cell *temp_alt = realloc(alt_cells, sizeof(Cell) * MAX_ROWS * cols);
+        uint32_t *temp_tabs = realloc(tabs, sizeof(uint32_t) * cols);
 
-        // Wipe the newly sized grids clean to prevent random garbage characters
-        memset(main_cells, 0, sizeof(Cell) * rows * cols);
-        memset(alt_cells, 0, sizeof(Cell) * rows * cols);
+        if (!temp_main || !temp_alt || !temp_tabs)
+        {
+            fprintf(stderr, "FATAL: Out of memory during terminal resize.\n");
+            exit(1);
+        }
+
+        main_cells = temp_main;
+        alt_cells = temp_alt;
+        tabs = temp_tabs;
+
+        // Wipe grids entirely because resizing columns breaks the 1D array wrapping logic
+        memset(main_cells, 0, sizeof(Cell) * MAX_ROWS * cols);
+        memset(alt_cells, 0, sizeof(Cell) * MAX_ROWS * cols);
 
         // Point the active lens to whichever buffer is currently in use
         cells = alt_buffer_active ? alt_cells : main_cells;
 
-        // Rebuild the tab stops for the new width
+        // Reset scroll state on window resize
+        head = 0;
+        history_count = 0;
+        scroll_offset = 0;
+
+        // Rebuild the tab stops for the new width to match POSIX 8-column standards
         for (uint32_t i = 0; i < cols; i++)
         {
-            tabs[i] = (i % 4 == 0) ? 1 : 0;
+            tabs[i] = (i != 0 && i % 8 == 0) ? 1 : 0;
         }
 
         // Reset boundaries to match the new height
@@ -1472,10 +1645,19 @@ void resizecb(lf_ui_state_t *ui, lf_window_t win, uint32_t width, uint32_t heigh
 
 int main(void)
 {
-    if (forkpty(&masterfd, NULL, NULL, NULL) == 0)
+    // SECURE: Capture the child process ID so we can clean it up later
+    pid_t shell_pid = forkpty(&masterfd, NULL, NULL, NULL);
+
+    if (shell_pid == 0)
     {
+        // Inside the child process
         execlp("/usr/bin/bash", "bash", NULL);
         perror("execlp");
+        exit(1);
+    }
+    else if (shell_pid < 0)
+    {
+        perror("forkpty failed");
         exit(1);
     }
 
@@ -1549,6 +1731,21 @@ int main(void)
             termnextevent(ui);
     }
 
-    printf("Hello World !!\n");
+    // STRICT C COMPLIANCE: Clean up all dynamically allocated heap memory to ensure 0 leaks
+    if (main_cells)
+        free(main_cells);
+    if (alt_cells)
+        free(alt_cells);
+    if (tabs)
+        free(tabs);
+
+    // Release the pseudo-terminal file descriptor back to the Linux kernel
+    if (masterfd >= 0)
+        close(masterfd);
+
+    // SECURE: Tell the Linux Kernel to reap the bash process so it doesn't become a Zombie
+    waitpid(shell_pid, NULL, 0);
+
+    printf("Terminator Shutting Down Cleanly.\n");
     return EXIT_SUCCESS;
 }
